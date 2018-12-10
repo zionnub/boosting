@@ -1,0 +1,496 @@
+#########Load Libraries#####
+library(RMySQL)
+library(dplyr)
+library(lubridate)
+library(reshape2)
+library(plyr)
+library(data.table)
+library(tidyverse)
+require(RGoogleAnalytics)
+require(googlesheets)
+library(gtools)
+library(RCurl)
+library(foreach)
+
+####### Register the process start time ###### 
+
+start_time <- Sys.time()
+Current_date <- today()
+Date_7 <- Current_date -7
+Date_30 <- Current_date-30
+Date_90 <- Current_date-90
+Date_180 <- Current_date-180
+Date_1_year <- Current_date-365
+
+ ##### Google Authentication ######
+token <- Auth("client_id","client_secret")
+ValidateToken(token)
+gs_auth()
+my_sheets <- gs_ls()
+gap<-gs_key("1FwC6Y8RO0VYmd3tZUPhs81YzcP3hlFEjVrIPqYGEjXQ")
+
+
+test<-gap %>%
+  gs_read(ws= "Overall" ,range= "A1:Y26")
+test[is.na(test)] <- ""
+
+cat_2<-gap %>%
+  gs_read(ws= "cat_lev_2" ,range= "A1:B26")
+cat_2[is.na(cat_2)] <- ""
+
+deboosting<-gap %>%
+  gs_read(ws= "deboosting", range="A1:A56000")
+deboosting[is.na(deboosting)] <- ""
+
+deboosting_1<-gap %>%
+  gs_read(ws= "deboosting", range="B1:B40000")
+deboosting_1[is.na(deboosting_1)] <- ""
+
+deboosting <- rbind(deboosting,deboosting_1)
+
+parameter_weights <-gap %>%
+  gs_read(ws= "parameter_weights" )
+
+
+server_credentials <-gap %>%
+  gs_read(ws= "server_credential" )
+
+sv_host<- server_credentials$value[1]
+sv_user <- server_credentials$value[2]
+sv_db <- server_credentials$value[3]
+sv_password <- server_credentials$value[4]
+
+###### Create Directory #####
+mainDir <- "C:/Users/user/Desktop/Boosting/V8/"
+subDir <- paste("outputDirectory-",Sys.Date())
+dir.create(file.path(mainDir, subDir), showWarnings = FALSE)
+setwd(file.path(mainDir, subDir))
+write.csv(test,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/request--",Sys.Date(),".csv",sep = ""),row.names = F)
+###### Gather Server credetials to fetch data #######
+
+# server_credentials <- read.csv("C:\\Users\\user\\Desktop\\Boosting\\reporting_server_credentials.csv", stringsAsFactors=FALSE)
+########## Define SQL Fetch and TryCatch #######
+
+fetchData <- function(username,passwd,db,host_ip,query) {
+  
+  data <- 0
+  tryCatch({
+    cat("trying to connect ")
+    con <- dbConnect(MySQL(),user=username,password=passwd,dbname= db,host= host_ip)
+    cat("connection successful ")
+    rs <- dbSendQuery(con,query)
+    data <- fetch(rs,n=-10)
+    cat("result fetched ")
+    dbClearResult(rs)
+    dbDisconnect(con)
+  } ,error = function(err){
+    cat("datafetch error ")
+    data <- 0
+  })
+  data
+}
+
+##################### Gather Catalog Data ##############
+
+  catalog_query <- ("
+                    Select 
+                     rsin
+                    ,catalog_cache.bids as bids
+                    ,catalog_cache.id_catalog_config as id_catalog_config
+                    ,catalog_cache.name as name
+                    ,catalog_cache.brand as brand
+                    ,catalog_cache.catalog_tag as catalog_tag
+                    ,COUNT(DISTINCT case when simple_status = 'active' THEN bids ELSE NULL END) as simples_active
+                    ,COUNT(DISTINCT CASE
+                    WHEN shop_visibility_sa = 1 OR shop_visibility_ae = 1
+                    THEN bids ELSE NULL
+                    END) as simples_live
+                    ,catalog_cache.category_level_1 as category_level_1
+                    ,catalog_cache.category_level_2 as category_level_2
+                    ,concat(category_level_1, '-',category_level_2) as categories
+                    ,min(if(special_price_sa is null or special_price_sa=91919191,ifnull(price_sa,91919191),ifnull(special_price_sa,91919191))) as special_price_sa
+                    ,config_created_at as creation_date
+                    ,shipping_time_max_sa as max_shipping_time                    
+                    ,delivery_time_max_sa as max_delivery_time
+                    ,product_supplier as supplier
+                    
+                    from catalog.catalog_cache
+                    where
+                    catalog_cache.source_status = 'active'
+                    and catalog_cache.config_status = 'active'
+                    and catalog_cache.pet_approved = 1
+                    and catalog_cache.db = 'SA'
+                    and catalog_cache.sku_config IN (SELECT sku_config FROM catalog.sku_trend WHERE on_date > curdate() - interval 7 day)
+                    GROUP BY
+                    1
+                    ORDER BY
+                    NULL
+
+  ")
+  
+  catalog_data <- fetchData(sv_user,sv_password,sv_db,sv_host, catalog_query)
+  catalog_data$creation_date <- lubridate::as_date(catalog_data$creation_date)
+  catalog_data <- catalog_data[!(is.na(catalog_data$rsin) | catalog_data$rsin==""), ]
+  catalog_data <- catalog_data[!(catalog_data$special_price_sa=="91919191" | catalog_data$special_price_sa=="919191"), ]
+  catalog_data <- catalog_data[!(catalog_data$special_price_sa>=10000), ]
+  
+  rsin_sku_link_query <- ("
+select rsin, sku_config from catalog.catalog_cache where is_default_rsin='1' and db='sa' group by 1 order by NULL
+                          " )
+  rsin_sku__link <- fetchData(sv_user,sv_password,sv_db,sv_host, rsin_sku_link_query)
+  catalog_data <- join(catalog_data, rsin_sku__link, by = "rsin", type = "left", match = "all")
+  
+  write.csv(catalog_data,"C:/Users/user/Desktop/Boosting/V8/Stable/catalog_data.csv",row.names = F)
+  
+  
+  
+  
+  ############## Fetch Competetior price ############
+  
+  
+  comp_price <- ("select 
+                 (select rsin from catalog.catalog_cache where db = 'sa' and seller_sku = comp_data.bids limit 1) as rsin
+                 ,comp_price_Sa as comp_price_sa
+                 from catalog.comp_data group by 1")
+  comp_price_data <- fetchData(sv_user,sv_password,sv_db,sv_host, comp_price)
+  catalog_data <- join(catalog_data, comp_price_data, by = "rsin", type = "left", match = "all")  
+  # write.csv(catalog_data,"C:/Users/user/Desktop/Boosting/v2/catalog_data_1.csv",row.names = F)
+  for(i in 1:length(catalog_data$comp_price_sa))
+  {
+     if(is.na(catalog_data$comp_price_sa[i])==TRUE) {
+       catalog_data$comp_price_sa[i] <- catalog_data$special_price_sa[i]
+     }
+  #catalog_data$comp_price_Sa[i][is.na(catalog_data$comp_price_Sa[i])] <- catalog_data$special_price_sa[i]
+    }
+  
+  
+  # if( catalog_data$special_price_sa == '91919191' | catalog_data$comp_price_Sa== '91919191')
+  # {
+  #   catalog_data$rel_price_diff <- '0'
+  # }
+  # else {if(catalog_data$comp_price_Sa > catalog_data$special_price_sa)
+  # {
+  #   catalog_data$rel_price_diff <- ((catalog_data$comp_price_Sa)- (catalog_data$special_price_sa))/catalog_data$special_price_sa
+  # }
+  #   else{
+  #     catalog_data$rel_price_diff <- '0'
+  #   }}
+  
+  for(i in 1: length(catalog_data$sku_config))
+    (
+  ifelse(
+    
+    (catalog_data$special_price_sa[i] == '91919191' | catalog_data$comp_price_sa[i] == '91919191'),
+    (catalog_data$rel_price_diff[i] <- '0'),
+    catalog_data$rel_price_diff[i] <- ifelse(catalog_data$comp_price_sa[i] > catalog_data$special_price_sa[i], ((catalog_data$comp_price_sa[i])- (catalog_data$special_price_sa[i]))/catalog_data$special_price_sa[i], 0)
+    
+  )
+    )
+  
+  write.csv(catalog_data,"C:/Users/user/Desktop/Boosting/v8/catalog_data_2.csv",row.names = F)
+  
+sale_query <- ("
+    SELECT
+        (select rsin from catalog.catalog_cache where db = 'sa' and sku_config = wadi_indexer.config_sku limit 1) as rsin
+               ,sum(case when ordered_at > curdate() - interval 7 day and platform not like '%android%' then 1 else 0 end) as sales_7d_web_ios
+               ,sum(case when ordered_at > curdate() - interval 14 day and platform not like '%android%' then 1 else 0 end) as sales_14d_web_ios
+               ,sum(case when ordered_at > curdate() - interval 21 day and platform not like '%android%' then 1 else 0 end) as sales_21d_web_ios
+               ,sum(case when ordered_at > curdate() - interval 84 day and platform not like '%android%' then 1 else 0 end) as sales_12W_web_ios
+               ,max(ordered_at) as last_ordered
+               FROM
+               buy_sell.wadi_indexer as wadi_indexer
+               WHERE
+               db = 'sa'
+               AND ordered_at > curdate() - interval 84 day
+               AND bob_item_status not in ('invalid','test_invalid')
+               GROUP BY
+               rsin
+               ORDER BY
+               NULL")
+
+  
+  sale_data <- fetchData(sv_user,sv_password,sv_db,sv_host, sale_query)
+  sale_data$last_ordered <- lubridate::as_date(sale_data$last_ordered)
+  
+  pdp_query <- ("
+  SELECT
+      (select rsin from catalog.catalog_cache where db = 'sa' and sku_config = ga_pdp.product_sku limit 1) as rsin
+                ,sum(if(update_date > curdate() - interval 7 day,product_detail_views,0)) as pdps_7d
+                ,sum(if(update_date > curdate() - interval 7 day and profile_id in (98014352,103857948),product_detail_views,0)) as pdps_7d_web_ios
+                FROM
+                marketing_analytics.ga_pdp
+                WHERE
+                joker not like '%ae%'
+                AND update_date > curdate() - interval 7 day
+                GROUP BY
+                rsin
+                ORDER BY
+                NULL")
+  
+  pdp_data <- fetchData(sv_user,sv_password,sv_db,sv_host, pdp_query)
+
+  data_sa <- join(catalog_data, sale_data, by = "rsin", type = "left", match = "all")
+  #Forcing NA sales to 0
+  data_sa$sales_7d_web_ios[is.na(data_sa$sales_7d_web_ios)] <- 0
+  data_sa$sales_7d[is.na(data_sa$sales_7d)] <- 0
+  data_sa$sales_14d_web_ios[is.na(data_sa$sales_14d_web_ios)] <- 0
+  data_sa$sales_21d_web_ios[is.na(data_sa$sales_21d_web_ios)] <- 0
+  data_sa$sales_12W_web_ios[is.na(data_sa$sales_12W_web_ios)] <- 0
+  data_sa$creation_date [is.na(data_sa$creation_date)] <- Date_1_year
+  data_sa$last_ordered [is.na(data_sa$last_ordered)] <- Date_1_year
+  data_sa$avg_sales <- round(data_sa$sales_12W_web_ios/12,0)
+  data_sa$sales_21d_web_ios <- round((data_sa$sales_21d_web_ios - data_sa$sales_14d_web_ios),0)
+  data_sa$sales_14d_web_ios <- round((data_sa$sales_14d_web_ios - data_sa$sales_7d_web_ios),0)
+  data_sa$sales_7d_web_ios[is.na(data_sa$sales_7d_web_ios)] <- 0
+  data_sa$sales_14d_web_ios[is.na(data_sa$sales_14d_web_ios)] <- 0
+  data_sa$sales_21d_web_ios[is.na(data_sa$sales_21d_web_ios)] <- 0
+  data_sa$avg_sales[is.na(data_sa$avg_sales)] <- 0
+  
+  
+  data_sa$sales_factor <- as.numeric( ifelse(data_sa$avg_sales>0 ,(3*data_sa$sales_7d_web_ios+2*data_sa$sales_14d_web_ios+data_sa$sales_21d_web_ios)/(6*data_sa$avg_sales),0))
+  data_sa$sales_factor <- ifelse(data_sa$sales_factor >2 ,2,(ifelse(data_sa$sales_factor >1,1,0)))
+  
+  data_sa <- join(data_sa, pdp_data, by = "rsin", type = "left", match = "all")
+  
+  data_sa$pips_7d <- ifelse(data_sa$pdps_7d_web_ios >= 100, data_sa$sales_7d_web_ios/data_sa$pdps_7d_web_ios, 0)
+  data_sa$pdps_7d[is.na(data_sa$pdps_7d)] <- 0
+
+  max_pdps <- max(data_sa$pdps_7d, na.rm = TRUE)
+  max_pips <- max(data_sa$pips_7d, na.rm = TRUE)
+  
+  data_sa$normalised_pdps <- ifelse(data_sa$pdps_7d > 0, data_sa$pdps_7d/max_pdps, 0)
+  data_sa$normalised_pips <- ifelse(data_sa$pips_7d > 0, data_sa$pips_7d/max_pips, 0)
+  #Force NA normalised pips to 0
+  data_sa$normalised_pips[is.na(data_sa$normalised_pips)] <- 0
+  data_sa$normalised_pdps[is.na(data_sa$normalised_pdps)] <- 0
+  
+  avg_pdps <- tail(sort(data_sa$normalised_pdps),1000)
+  avg_pdps <- mean(avg_pdps)
+  max_sale <- max(data_sa$sales_7d_web_ios, na.rm = TRUE)
+  data_sa$normalized_sale <- ifelse(data_sa$sales_7d_web_ios > 0, data_sa$sales_7d_web_ios/max_sale, 0)
+  
+  data_sa$novelty_rank <- ifelse(data_sa$creation_date >= Date_7,2,ifelse(data_sa$creation_date >= Date_30,1,0))
+  data_sa$purchase_rank <- ifelse(data_sa$last_ordered >= Date_7,4,ifelse(data_sa$last_ordered >= Date_30,3,ifelse(data_sa$last_ordered >= Date_90,2,ifelse(data_sa$last_ordered >= Date_180,1,0))))
+  
+  price_average <- aggregate(data_sa$special_price_sa, by=list(category_level_2=data_sa$category_level_2), FUN=mean)
+  price_average$x <- round(price_average$x,0)
+  names(price_average)[2]<-paste("category_wise_asp")
+  data_sa <- left_join(data_sa,price_average,by="category_level_2")
+  data_sa$company_asp <- as.integer(mean(data_sa$special_price_sa))
+  data_sa$asp_adjusted_pips <- (data_sa$category_wise_asp*data_sa$pips_7d)/data_sa$company_asp
+  data_sa$pips_7d[is.na(data_sa$pips_7d)] <- 0
+  data_sa$asp_adjusted_pips[is.na(data_sa$asp_adjusted_pips)] <- 0
+  data_sa$company_pips <- mean(data_sa$pips_7d)
+  data_sa$pips_factor <- ifelse(data_sa$asp_adjusted_pips > data_sa$company_pips ,1,0)
+  
+  Brand_average_pdp <- aggregate(data_sa$pdps_7d, by=list(brand=data_sa$brand), FUN=sum)
+  Brand_average_pdp$x <- round(Brand_average_pdp$x,0)
+  names(Brand_average_pdp)[2]<-paste("PDP Per SKU")
+  Brand_average_pdp  <- arrange(Brand_average_pdp,-Brand_average_pdp$`PDP Per SKU`)
+  Top_10_brand_value <- Brand_average_pdp$`PDP Per SKU`[11]
+  Top_25_brand_value <- Brand_average_pdp$`PDP Per SKU`[26]
+  Top_50_brand_value <- Brand_average_pdp$`PDP Per SKU`[51]
+  Top_100_brand_value <- Brand_average_pdp$`PDP Per SKU`[101]
+  
+  Brand_average_pdp$brand_perception <- ifelse(Brand_average_pdp$`PDP Per SKU`>Top_10_brand_value,3,ifelse(Brand_average_pdp$`PDP Per SKU`>Top_25_brand_value,2,ifelse(Brand_average_pdp$`PDP Per SKU`>Top_50_brand_value,1,ifelse(Brand_average_pdp$`PDP Per SKU`>Top_100_brand_value,0.5,0))))
+  data_sa <- join(data_sa,Brand_average_pdp,by="brand", type="left",match="all")
+  
+  # parameter_weights <- read_csv("C:/Users/user/Desktop/Boosting/V8/parameter_weights.csv", col_types = cols(pips_weight = col_double()))
+  
+  data_sa <- join(data_sa, parameter_weights, by = "categories", type = "left", match = "all")
+  
+  data_length <- length(data_sa$sku_config)
+  data_sa$rand <- runif(data_length,0.75,2)
+  data_sa$score <- round((data_sa$normalised_pdps*data_sa$pdps_weight)+(data_sa$asp_adjusted_pips*0.1)+(data_sa$novelty_rank*data_sa$brand_perception*avg_pdps/2*(ifelse(data_sa$special_price_sa>1000,data_sa$rand,ifelse(data_sa$special_price_sa>500,0.75,ifelse(data_sa$special_price_sa>100,0.5,0)))))+(data_sa$sales_factor*avg_pdps/2),6)
+  # data_sa$score <- (data_sa$normalised_pdps*data_sa$pdps_weight + data_sa$normalised_pips*data_sa$pips_weight)*(data_sa$simples_live/data_sa$simples_active)
+  # data_sa <- ddply(data_sa,"sku_config","transform",score1 = ((normalised_pdps*pdps_weight)+(2*novelty_rank*avg_pdps)+(sales_factor*avg_pdps)))
+   data_sa$score[is.nan(data_sa$score)] <- 0
+  
+  data_sa$top_bucket <- 50
+  data_sa$top_boost <- 999
+  
+  data_sa$category_weight_multilpier <- 1
+  
+  
+  DT <- data.table(data_sa)
+  DT <- DT[, list(sku_config, rank = rank(-score, ties.method="min"))]
+  dt <- as.data.frame(DT)
+  # write.csv(dt,"C:/Users/user/Desktop/Boosting/v2/dt.csv",row.names = F)
+  data_sa <- join(data_sa,dt, type = "left", match = "all")
+  # write.csv(data_sa,"C:/Users/user/Desktop/Boosting/v2/data_complete.csv",row.names = F)
+  
+  data_sa<- ddply(data_sa,"sku_config",transform,boost_value = (top_bucket*1000) + top_boost - (category_weight_multilpier) - rank + 2,bucket_a = floor( ((top_bucket*1000) + top_boost - (category_weight_multilpier) - rank + 2)/1000),boost_a = ((top_bucket*1000) + top_boost - (category_weight_multilpier) - rank + 2)%%1000)
+  
+  data_sa$boost_value[data_sa$boost_value<0] <- 0
+  
+  data_sa$boost_a[data_sa$boost_a<0] <- 0
+  
+  data_sa$bucket_a[data_sa$bucket_a<0] <- 0
+  write.csv(data_sa,"C:/Users/user/Desktop/Boosting/v8/data_complete.csv",row.names = F)
+  
+  ######## Deboosting #####
+  
+  #### ASP Adjusted PIPS Deboost #####
+  
+  data_sa$bucket_a <- ifelse(data_sa$asp_adjusted_pips< 0.5*data_sa$company_pips,data_sa$bucket_a-2,ifelse(data_sa$asp_adjusted_pips< data_sa$company_pips | data_sa$sales_7d_web_ios <20,data_sa$bucket_a-1,data_sa$bucket_a))
+  
+  #### Competitor Price Deboost #####
+  
+  data_sa$boost_a <- ifelse(data_sa$special_price_sa*0.975>data_sa$comp_price_sa | data_sa$sales_7d_web_ios <25 ,data_sa$boost_a-200,data_sa$boost_a)
+  
+  #### Last Sold Deboost ####
+  
+  data_sa$bucket_a <- ifelse(data_sa$last_ordered <Date_180,data_sa$bucket_a-20,ifelse(data_sa$last_ordered <Date_90,data_sa$bucket_a-10,ifelse(data_sa$last_ordered <Date_30,data_sa$bucket_a-5,ifelse(data_sa$last_ordered <Date_7,data_sa$bucket_a-2,data_sa$bucket_a))))
+  #### Delivery Time Deboost ####
+  # data_sa$bucket_a <- ifelse(data_sa$max_delivery_time >7 , data_sa$bucket_a-1,data_sa$bucket_a)
+  
+  
+  #### Deboost all without Sales ###
+  
+  data_sa$bucket_a <- ifelse(data_sa$sales_12W_web_ios == 0,0,data_sa$bucket_a)
+  
+  #### Cut Size Deboost ####
+  
+  data_sa$bucket_a <- as.integer((data_sa$simples_active/data_sa$simples_live)*data_sa$bucket_a)
+  
+  ##### remove all negetive values ####
+  
+  data_sa$bucket_a <- ifelse(data_sa$bucket_a<0,0,data_sa$bucket_a)
+  data_sa$bucket_a <- ifelse(data_sa$bucket_a>50,0,data_sa$bucket_a)
+  data_sa$boost_a <- ifelse(data_sa$boost_a<0,0,data_sa$boost_a)
+  data_sa$bucket_a[is.na(data_sa$bucket_a)] <- 0
+  
+  write.csv(data_sa,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/Complete_data--",Sys.Date(),".csv",sep = ""),row.names = F)
+  
+  cat <- unique(data_sa$category_level_1)
+  N<- length(cat)
+  
+  cat2 <- unique(data_sa$category_level_2)
+  N2<- length(cat2)
+  
+  
+  
+  data_sa_test <- data_sa[,c("sku_config", "category_level_1", "name", "bucket_a", "boost_a")]
+  write.csv(data_sa_test,"C:/Users/user/Desktop/Boosting/V8/data_sa_test_v8.csv",row.names = F)
+  data_sa_test$category_level_1 <- as.character(data_sa_test$category_level_1)
+  
+  
+  
+  #the easier way
+  
+  
+  
+  
+  # sheets <-gs_ws_ls(gap)
+  # s_l <- as.numeric(length(sheets))
+  # Sl <- s_l -3
+  # #fretching data from google sheets
+  # test <- list()
+  # for( i in 1:Sl)
+  # {
+  #     df<-gap %>%
+  #     gs_read(ws= sheets[i])
+  #     df[is.na(df)] <- ""
+  #     lis <-list(assign(paste("df_",i,sep=""),df))
+  #     # test <- smartbind(test,lis)
+  #     test <- bind_rows(test,lis)
+  #     test[is.na(test)] <- ""
+  #     # test<- append(test,lis)
+  #     }
+  
+  
+  
+  
+  
+  for(i in 1:N)
+  {
+    data_cat <- subset(data_sa_test,category_level_1 == cat[i])
+    print(paste(i,cat[i]))
+    data_cat <- data_cat[order(-data_cat$bucket_a,-data_cat$boost_a),]
+    data_cat_f <- data_cat[,c(1,4,5)]
+    cat_name <- cat[i]
+    req_list <-unlist(test[,cat_name])
+    sku_config <- as.list(data_cat$sku_config)
+    sku_config <- (union(req_list,sku_config))
+    sku_config <- sku_config[sku_config != ""]
+    bucket_a <- as.list(data_cat$bucket_a)
+    boost_a <- as.list(data_cat$boost_a)
+    df <- list(sku_config,bucket_a,boost_a)
+    max_length <- max(sapply(df,length))
+    df<- sapply(df, function(x){
+      c(x, rep(NA, max_length - length(x)))
+    })
+    df[is.na(df)] <- "1"
+    # df <- data.frame(matrix(unlist(df),byrow = T))
+    # df <- do.call(rbind.data.frame,df)
+    # df <- cbind(sku_config,bucket_a)
+    #df <- cbind(df,boost_a)
+    
+    write.csv(df,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat[i],".csv",sep = ""),row.names = F)
+    rename_del <- read.csv(paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat[i],".csv",sep = ""), stringsAsFactors=FALSE)
+    names(rename_del)<- c("sku_config","bucket_a","boost_a")
+    # rename_del <- rename_del[-which(rename_del$sku_config == ""), ]
+    write.csv(rename_del,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat[i],".csv",sep = ""),row.names = F)
+  }  
+  
+  myFunction <- function(){
+    
+    data_cat <- subset(data_sa,category_level_2 == cat2[a])
+    print(paste(a,cat2[a]))
+    data_cat <- data_cat[order(-data_cat$bucket_a,-data_cat$boost_a),]
+    data_cat_f <- data_cat[,c(17,55,56)]
+    cat_name <- cat2[a]
+    req_list <-unlist(cat_2[,cat_name])
+    sku_config <- as.list(data_cat$sku_config)
+    sku_config <- (union(req_list,sku_config))
+    sku_config <- sku_config[sku_config != ""]
+    bucket_a <- as.list(data_cat$bucket_a)
+    boost_a <- as.list(data_cat$boost_a)
+    df <- list(sku_config,bucket_a,boost_a)
+    max_length <- max(sapply(df,length))
+    df<- sapply(df, function(x){
+      c(x, rep(NA, max_length - length(x)))
+    })
+    df[is.na(df)] <- "1"
+    # df <- data.frame(matrix(unlist(df),byrow = T))
+    # df <- do.call(rbind.data.frame,df)
+    # df <- cbind(sku_config,bucket_a)
+    #df <- cbind(df,boost_a)
+    
+    write.csv(df,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat2[a],".csv",sep = ""),row.names = F)
+    rename_del <- read.csv(paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat2[a],".csv",sep = ""), stringsAsFactors=FALSE)
+    names(rename_del)<- c("sku_config","bucket_a","boost_a")
+    # rename_del <- rename_del[-which(rename_del$sku_config == ""), ]
+    write.csv(rename_del,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/",cat2[a],".csv",sep = ""),row.names = F)
+    
+    
+  }
+  
+  
+  
+  
+  
+  
+  for(a in 1:N2)
+  {
+  b <- length(colnames(cat_2))
+  for(j in 1:b )
+  {
+    
+  if(colnames(cat_2)[j] == cat2[a]){myFunction()}
+  } 
+  }  
+  
+  
+  ####### Manual Deboosting #######
+  deboosting$bucket_a <- data_sa$bucket_a[match(deboosting$sku_config,data_sa$sku_config,NA)]
+  deboosting$boost_a <- data_sa$boost_a[match(deboosting$sku_config,data_sa$sku_config,NA)]
+  deboosting$bucket_a[is.na(deboosting$bucket_a)] <- "0"
+  deboosting$boost_a[is.na(deboosting$boost_a)] <- "0"
+  deboosting$bucket_a<- as.numeric(deboosting$bucket_a)
+  deboosting$bucket_a <- ifelse(deboosting$bucket_a>3,deboosting$bucket_a-3,deboosting$bucket_a)
+  write.csv(deboosting,paste("C:/Users/user/Desktop/Boosting/V8/",subDir,"/deboosting.csv",sep = ""),row.names = F)
+  
+   
+  Sys.time() - start_time
+  
